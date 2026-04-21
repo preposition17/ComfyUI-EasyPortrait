@@ -15,6 +15,9 @@ import folder_paths
 
 MODEL_ROOT = os.path.join(folder_paths.models_dir, "easyportrait")
 CHECKPOINT_ROOT = os.path.join(MODEL_ROOT, "checkpoints")
+ONNX_ROOT = os.path.join(MODEL_ROOT, "onnx")
+ONNX_REPO_ID = "sadzip/EasyPortrait-ONNX"
+ONNX_REPO_URL = f"https://huggingface.co/{ONNX_REPO_ID}/resolve/main"
 folder_paths.add_model_folder_path("easyportrait", MODEL_ROOT)
 
 IMG_MEAN = [143.55267075, 132.96705975, 126.94924335]
@@ -41,6 +44,20 @@ TASK_COLORS = {
     TASK_PORTRAIT: np.array([0, 255, 127], dtype=np.uint8),
     TASK_FACE: np.array([255, 140, 0], dtype=np.uint8),
 }
+
+LABEL_COLORS = {
+    "background": np.array([32, 32, 32], dtype=np.uint8),
+    "person": np.array([0, 255, 127], dtype=np.uint8),
+    "skin": np.array([255, 184, 128], dtype=np.uint8),
+    "left brow": np.array([128, 80, 255], dtype=np.uint8),
+    "right brow": np.array([88, 120, 255], dtype=np.uint8),
+    "left eye": np.array([0, 220, 255], dtype=np.uint8),
+    "right eye": np.array([0, 148, 255], dtype=np.uint8),
+    "lips": np.array([255, 72, 128], dtype=np.uint8),
+    "teeth": np.array([245, 245, 220], dtype=np.uint8),
+}
+
+MASK_MODES = ["binary", "layers"]
 
 
 @dataclass(frozen=True)
@@ -325,8 +342,9 @@ MODEL_SPECS = [
     ),
 ]
 
-MODEL_CHOICES = [spec.display_name for spec in MODEL_SPECS]
-MODELS_BY_NAME = {spec.display_name: spec for spec in MODEL_SPECS}
+ONNX_MODEL_SPECS = [spec for spec in MODEL_SPECS if spec.builder_name is not None]
+MODEL_CHOICES = [spec.display_name for spec in ONNX_MODEL_SPECS]
+MODELS_BY_NAME = {spec.display_name: spec for spec in ONNX_MODEL_SPECS}
 
 
 def _num_classes(task: str) -> int:
@@ -897,7 +915,7 @@ def _checkpoint_meta_config(spec: ModelSpec, checkpoint_path: str) -> dict:
             "Install a mmsegmentation 0.30.0 compatible mmcv package."
         ) from exc
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     meta = checkpoint.get("meta", {}) if isinstance(checkpoint, dict) else {}
     config_text = meta.get("config") or meta.get("cfg")
     if not isinstance(config_text, str) or not config_text.strip():
@@ -928,60 +946,108 @@ def _checkpoint_meta_config(spec: ModelSpec, checkpoint_path: str) -> dict:
 
 
 class EasyPortraitModelCache:
-    _models: dict[tuple[str, str], object] = {}
+    _models: dict[tuple[str, tuple[str, ...]], object] = {}
     _lock = threading.Lock()
 
     @classmethod
     def load(cls, spec: ModelSpec):
-        cache_key = (spec.key, _device_name())
+        providers = _onnx_providers()
+        cache_key = (spec.key, tuple(providers))
         with cls._lock:
             if cache_key in cls._models:
                 return cls._models[cache_key]
 
-            model = _init_model(spec)
+            model = _init_model(spec, providers)
             cls._models[cache_key] = model
             return model
 
 
-def _device_name() -> str:
-    return "cuda:0" if torch.cuda.is_available() else "cpu"
-
-
-def _init_model(spec: ModelSpec):
+def _onnx_providers() -> list[str]:
     try:
-        from mmcv import Config
-        from mmseg.apis import init_segmentor
+        import onnxruntime as ort
     except ImportError as exc:
-        missing = getattr(exc, "name", None)
-        if missing == "mmcv":
-            raise RuntimeError(
-                "EasyPortrait dependency error: module 'mmcv' is not installed. "
-                "Installing only mmsegmentation is not enough; install a "
-                "mmsegmentation 0.30.0 compatible mmcv package."
-            ) from exc
-        if missing == "mmseg":
-            raise RuntimeError(
-                "EasyPortrait dependency error: module 'mmseg' is not installed. "
-                "Install mmsegmentation 0.30.0 and a compatible mmcv package."
-            ) from exc
         raise RuntimeError(
-            "EasyPortrait requires mmsegmentation 0.30.0 with compatible mmcv. "
-            "Install the custom node requirements before using this node."
+            "EasyPortrait dependency error: module 'onnxruntime' is not installed. "
+            "Install this custom node's requirements before using it."
         ) from exc
 
-    checkpoint_path = _download_checkpoint(spec)
-    if spec.builder_name is not None:
-        config_dict = CONFIG_BUILDERS[spec.builder_name](spec)
-    else:
-        config_dict = _checkpoint_meta_config(spec, checkpoint_path)
+    available = ort.get_available_providers()
+    providers = []
+    if "CUDAExecutionProvider" in available:
+        providers.append("CUDAExecutionProvider")
+    providers.append("CPUExecutionProvider")
+    return providers
 
-    config = Config(_clone_model_config(config_dict))
-    model = init_segmentor(config, checkpoint=checkpoint_path, device=_device_name())
-    if _device_name() == "cpu":
-        model = _replace_sync_batchnorm(model)
 
-    model.CLASSES = CLASS_NAMES[spec.task]
-    return model
+def _onnx_filename(spec: ModelSpec) -> str:
+    return f"{spec.key}.onnx"
+
+
+def _onnx_path(spec: ModelSpec) -> str:
+    return os.path.join(ONNX_ROOT, _onnx_filename(spec))
+
+
+def _hf_headers() -> dict[str, str]:
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    )
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _download_onnx(spec: ModelSpec) -> str:
+    _ensure_directory(ONNX_ROOT)
+    target = _onnx_path(spec)
+    if os.path.exists(target) and os.path.getsize(target) > 0:
+        return target
+
+    url = f"{ONNX_REPO_URL}/{_onnx_filename(spec)}"
+    temp_path = f"{target}.part"
+    response = requests.get(
+        url,
+        headers=_hf_headers(),
+        stream=True,
+        timeout=(10, 600),
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(
+            f"Could not download ONNX model '{_onnx_filename(spec)}' from "
+            f"{ONNX_REPO_ID}. If the repository is private, set HF_TOKEN before "
+            "starting ComfyUI."
+        ) from exc
+
+    with open(temp_path, "wb") as handle:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                handle.write(chunk)
+
+    if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+        raise RuntimeError(f"Downloaded ONNX model is empty: {url}")
+
+    os.replace(temp_path, target)
+    return target
+
+
+def _init_model(spec: ModelSpec, providers: list[str]):
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise RuntimeError(
+            "EasyPortrait dependency error: module 'onnxruntime' is not installed. "
+            "Install this custom node's requirements before using it."
+        ) from exc
+
+    session_options = ort.SessionOptions()
+    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session = ort.InferenceSession(
+        _download_onnx(spec),
+        sess_options=session_options,
+        providers=providers,
+    )
+    return session
 
 
 def _to_numpy_image(image_tensor: torch.Tensor) -> np.ndarray:
@@ -990,16 +1056,138 @@ def _to_numpy_image(image_tensor: torch.Tensor) -> np.ndarray:
     return image
 
 
+def _resize_image(image: np.ndarray, size: int) -> np.ndarray:
+    if image.shape[0] == size and image.shape[1] == size:
+        return image
+    return np.asarray(Image.fromarray(image).resize((size, size), Image.BILINEAR))
+
+
+def _resize_segmentation(segmentation: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    height, width = shape
+    if segmentation.shape == (height, width):
+        return segmentation
+    resized = Image.fromarray(segmentation.astype(np.uint8)).resize(
+        (width, height),
+        Image.NEAREST,
+    )
+    return np.asarray(resized)
+
+
+def _preprocess_onnx(image: np.ndarray, spec: ModelSpec) -> np.ndarray:
+    image = _resize_image(image, spec.input_size).astype(np.float32)
+    image = image[..., ::-1]
+    image = (image - np.asarray(IMG_MEAN, dtype=np.float32)) / np.asarray(
+        IMG_STD, dtype=np.float32
+    )
+    image = np.ascontiguousarray(image.transpose(2, 0, 1)[None])
+    return image
+
+
+def _segment_onnx(model, image: np.ndarray, spec: ModelSpec) -> np.ndarray:
+    input_name = model.get_inputs()[0].name
+    output_name = model.get_outputs()[0].name
+    output = model.run([output_name], {input_name: _preprocess_onnx(image, spec)})[0]
+    output = np.asarray(output)
+    if output.ndim == 4:
+        segmentation = output.argmax(axis=1)[0].astype(np.uint8)
+    elif output.ndim == 3:
+        segmentation = output[0].astype(np.uint8)
+    elif output.ndim == 2:
+        segmentation = output.astype(np.uint8)
+    else:
+        raise RuntimeError(f"Unexpected EasyPortrait ONNX output shape: {output.shape}")
+    return _resize_segmentation(segmentation, image.shape[:2])
+
+
 def _to_mask(segmentation: np.ndarray, spec: ModelSpec) -> np.ndarray:
     if spec.task == TASK_PORTRAIT:
         return (segmentation == 1).astype(np.float32)
     return (segmentation > 0).astype(np.float32)
 
 
-def _make_preview(image: np.ndarray, mask: np.ndarray, spec: ModelSpec) -> np.ndarray:
-    color = TASK_COLORS[spec.task].astype(np.float32)
+def _normalize_label(label: str) -> str:
+    return " ".join(label.strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+def _label_map(spec: ModelSpec) -> dict[str, int]:
+    return {_normalize_label(label): index for index, label in enumerate(CLASS_NAMES[spec.task])}
+
+
+def _parse_labels(
+    labels: str,
+    spec: ModelSpec,
+    *,
+    person: bool,
+    skin: bool,
+    left_brow: bool,
+    right_brow: bool,
+    left_eye: bool,
+    right_eye: bool,
+    lips: bool,
+    teeth: bool,
+    background: bool,
+) -> list[tuple[str, int]]:
+    label_map = _label_map(spec)
+    if labels and labels.strip():
+        raw_labels = labels.split(",")
+    else:
+        raw_labels = [
+            label
+            for label, enabled in (
+                ("person", person),
+                ("skin", skin),
+                ("left brow", left_brow),
+                ("right brow", right_brow),
+                ("left eye", left_eye),
+                ("right eye", right_eye),
+                ("lips", lips),
+                ("teeth", teeth),
+                ("background", background),
+            )
+            if enabled
+        ]
+
+    selected = []
+    seen = set()
+    for raw_label in raw_labels:
+        normalized = _normalize_label(str(raw_label))
+        if not normalized or normalized in seen:
+            continue
+        if normalized not in label_map:
+            continue
+        selected.append((CLASS_NAMES[spec.task][label_map[normalized]], label_map[normalized]))
+        seen.add(normalized)
+
+    if selected:
+        return selected
+
+    fallback = "person" if spec.task == TASK_PORTRAIT else "skin"
+    return [(fallback, label_map[fallback])]
+
+
+def _mask_for_label(segmentation: np.ndarray, label_index: int) -> np.ndarray:
+    return (segmentation == label_index).astype(np.float32)
+
+
+def _make_binary_mask(segmentation: np.ndarray, labels: list[tuple[str, int]]) -> np.ndarray:
+    selected_indices = [label_index for _, label_index in labels]
+    return np.isin(segmentation, selected_indices).astype(np.float32)
+
+
+def _make_preview(
+    image: np.ndarray,
+    segmentation: np.ndarray,
+    labels: list[tuple[str, int]],
+) -> np.ndarray:
     overlay = image.astype(np.float32).copy()
-    overlay[mask > 0.5] = overlay[mask > 0.5] * 0.45 + color * 0.55
+    for label, label_index in labels:
+        mask = segmentation == label_index
+        if not np.any(mask):
+            continue
+        color = LABEL_COLORS.get(label, np.array([255, 140, 0], dtype=np.uint8)).astype(
+            np.float32
+        )
+        overlay[mask] = overlay[mask] * 0.45 + color * 0.55
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
@@ -1010,6 +1198,24 @@ class EasyPortraitSegment:
             "required": {
                 "image": ("IMAGE",),
                 "model_name": (MODEL_CHOICES, {"default": MODEL_CHOICES[0]}),
+                "mode": (MASK_MODES, {"default": "binary"}),
+                "person": ("BOOLEAN", {"default": True}),
+                "skin": ("BOOLEAN", {"default": False}),
+                "left_brow": ("BOOLEAN", {"default": False}),
+                "right_brow": ("BOOLEAN", {"default": False}),
+                "left_eye": ("BOOLEAN", {"default": False}),
+                "right_eye": ("BOOLEAN", {"default": False}),
+                "lips": ("BOOLEAN", {"default": False}),
+                "teeth": ("BOOLEAN", {"default": False}),
+                "background": ("BOOLEAN", {"default": False}),
+                "labels": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "placeholder": "Optional comma-separated labels",
+                    },
+                ),
             }
         }
 
@@ -1018,38 +1224,52 @@ class EasyPortraitSegment:
     FUNCTION = "segment"
     CATEGORY = "EasyPortrait"
 
-    def segment(self, image, model_name):
+    def segment(
+        self,
+        image,
+        model_name,
+        mode,
+        person,
+        skin,
+        left_brow,
+        right_brow,
+        left_eye,
+        right_eye,
+        lips,
+        teeth,
+        background,
+        labels,
+    ):
         spec = MODELS_BY_NAME[model_name]
         model = EasyPortraitModelCache.load(spec)
-
-        try:
-            from mmseg.apis import inference_segmentor
-        except ImportError as exc:
-            missing = getattr(exc, "name", None)
-            if missing == "mmcv":
-                raise RuntimeError(
-                    "EasyPortrait dependency error: module 'mmcv' is not installed. "
-                    "Installing only mmsegmentation is not enough; install a "
-                    "mmsegmentation 0.30.0 compatible mmcv package."
-                ) from exc
-            raise RuntimeError(
-                "EasyPortrait requires mmsegmentation 0.30.0 with compatible mmcv. "
-                "Install the custom node requirements before using this node."
-            ) from exc
+        selected_labels = _parse_labels(
+            labels,
+            spec,
+            person=person,
+            skin=skin,
+            left_brow=left_brow,
+            right_brow=right_brow,
+            left_eye=left_eye,
+            right_eye=right_eye,
+            lips=lips,
+            teeth=teeth,
+            background=background,
+        )
 
         masks = []
         previews = []
 
         for image_item in image:
             image_np = _to_numpy_image(image_item)
-            result = inference_segmentor(model, image_np)
-            segmentation = result[0] if isinstance(result, (list, tuple)) else result
-            segmentation = np.asarray(segmentation)
+            segmentation = _segment_onnx(model, image_np, spec)
 
-            mask = _to_mask(segmentation, spec)
-            preview = _make_preview(image_np, mask, spec)
+            if mode == "layers":
+                for _, label_index in selected_labels:
+                    masks.append(torch.from_numpy(_mask_for_label(segmentation, label_index)))
+            else:
+                masks.append(torch.from_numpy(_make_binary_mask(segmentation, selected_labels)))
 
-            masks.append(torch.from_numpy(mask))
+            preview = _make_preview(image_np, segmentation, selected_labels)
             previews.append(torch.from_numpy(preview.astype(np.float32) / 255.0))
 
         return (torch.stack(masks, dim=0), torch.stack(previews, dim=0))
